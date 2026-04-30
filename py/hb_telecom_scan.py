@@ -20,16 +20,13 @@ TVBOX_FILE = "py/hb_telecom_tvbox.txt"
 HISTORY_FILE = "py/scanned_history.json"
 CONCURRENCY = 200 if sys.platform == 'win32' else 1000 
 
-# 🚫 黑名单列表：直接在这里填写那些无流量、失效的 IP
+# 🚫 黑名单列表
 IP_BLACKLIST = [
     "42.231.62.137", 
     "42.231.1.1",
-    # "在此继续添加你想屏蔽的IP..."
 ]
 
 PROVINCIAL_LOGIC = ['浙江卫视', '湖南卫视', '东方卫视', '北京卫视', '江苏卫视', '江西卫视', '深圳卫视', '湖北卫视', '吉林卫视', '四川卫视', '天津卫视', '宁夏卫视', '安徽卫视', '山东卫视', '山西卫视', '广东卫视', '广西卫视', '东南卫视', '内蒙古卫视', '黑龙江卫视', '新疆卫视', '河北卫视', '河南卫视', '云南卫视', '海南卫视', '甘肃卫视', '西藏卫视', '贵州卫视', '辽宁卫视', '陕西卫视', '青海卫视', '康巴卫视', '三沙卫视', '大湾区卫视']
-
-# ... (update_history_log 和 clean_and_weight 函数保持不变) ...
 
 def update_history_log(current_ips):
     existing_history = []
@@ -89,11 +86,24 @@ async def fetch_data(session, ip_list):
                                 chunk = []
                                 for item in data["data"]:
                                     name = item.get("name", "")
+                                    raw_url = item.get("url", "")
+                                    chid = item.get("chid", "")
+                                    
+                                    # --- 核心修改逻辑：URL 拼接逻辑 ---
+                                    # 如果原始 url 不包含 tsfile 或 .m3u8，则视为组播格式，使用 chid 补全
+                                    if "tsfile" in raw_url.lower() or ".m3u8" in raw_url.lower():
+                                        final_url = f"http://{ip}:{TARGET_PORT}{raw_url}"
+                                    else:
+                                        # 将 chid 转换为字符串，并用 0 补全至 4 位
+                                        formatted_chid = str(chid).zfill(4)
+                                        final_url = f"http://{ip}:{TARGET_PORT}/tsfile/live/{formatted_chid}_1.m3u8?key=txiptv&playlive=1&authid=0"
+                                    # --------------------------------
+
                                     clean_name, weight = clean_and_weight(name)
                                     cat = "央视" if weight < 100 else ("卫视" if weight < 300 else "地方")
                                     chunk.append({
                                         "name": clean_name,
-                                        "url": f"http://{ip}:{TARGET_PORT}{item.get('url')}",
+                                        "url": final_url,
                                         "cat": cat,
                                         "weight": float(weight),
                                         "ip": ip
@@ -113,7 +123,6 @@ async def fetch_data(session, ip_list):
     return results
 
 async def main():
-    # --- 1. 加载历史存量 IP ---
     history_ips = []
     if os.path.exists(HISTORY_FILE):
         try:
@@ -121,11 +130,7 @@ async def main():
                 history_ips = json.load(f)
         except: pass
 
-    # --- 2. 生成全量爆破 IP 列表 ---
     scan_ips = [f"{TARGET_PREFIX}.{i}.{j}" for i in range(256) for j in range(256)]
-    
-    # --- 3. 合并并过滤黑名单 ---
-    # 先合并历史和扫描列表，然后排除黑名单中的 IP
     all_ips = [ip for ip in dict.fromkeys(history_ips + scan_ips) if ip not in IP_BLACKLIST]
     
     if IP_BLACKLIST:
