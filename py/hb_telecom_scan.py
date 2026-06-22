@@ -11,14 +11,16 @@ from tqdm import tqdm
 # 屏蔽 Python 3.14+ 的弃用警告
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-# --- 配置 ---
-TARGET_PREFIXES = ["171.38", "60.223"] 
-TARGET_PORT = 8082
+# --- 核心配置修改：支持不同网段对应不同端口 ---
+TARGET_CONFIG = {
+    "171.38": 8082,
+    "60.223": 9003
+}
 CHECK_PATH = "/iptv/live/1000.json?key=txipt"
 M3U_FILE = "py/hb_telecom.m3u"
 TVBOX_FILE = "py/hb_telecom_tvbox.txt"
 HISTORY_FILE = "py/scanned_history.json"
-CONCURRENCY = 200 if sys.platform == 'win32' else 1000 
+CONCURRENCY = 200 if sys.platform == 'win32' else 800  # 稍微平滑并发，防止被运营商丢包
 
 # 🚫 黑名单列表
 IP_BLACKLIST = [
@@ -53,13 +55,14 @@ def clean_and_weight(name):
         if p in name: return p, 100 + i 
     return name, 999
 
-async def check_host_alive(semaphore, ip, pbar):
+# 修改探测函数：支持传入对应的 port
+async def check_host_alive(semaphore, ip, port, pbar):
     async with semaphore:
         writer = None
         try:
-            fut = asyncio.open_connection(ip, TARGET_PORT)
-            reader, writer = await asyncio.wait_for(fut, timeout=2.0)
-            return ip
+            fut = asyncio.open_connection(ip, port)
+            reader, writer = await asyncio.wait_for(fut, timeout=2.5)  # 稍微宽容一点超时
+            return (ip, port)  # 成功后返回 IP 和端口元组
         except:
             return None
         finally:
@@ -70,15 +73,16 @@ async def check_host_alive(semaphore, ip, pbar):
                     pass
             pbar.update(1)
 
-async def fetch_data(session, ip_list):
+# 修改获取数据函数：提取各自绑定的 port
+async def fetch_data(session, target_list):
     results = []
     fetch_limit = asyncio.Semaphore(5) 
 
-    async def fetch_single_ip(ip):
+    async def fetch_single_ip(ip, port):
         async with fetch_limit:
             for attempt in range(3):
                 try:
-                    url = f"http://{ip}:{TARGET_PORT}{CHECK_PATH}"
+                    url = f"http://{ip}:{port}{CHECK_PATH}"
                     async with session.get(url, timeout=10) as resp:
                         if resp.status == 200:
                             data = await resp.json(content_type=None)
@@ -89,15 +93,12 @@ async def fetch_data(session, ip_list):
                                     raw_url = item.get("url", "")
                                     chid = item.get("chid", "")
                                     
-                                    # --- 核心修改逻辑：URL 拼接逻辑 ---
-                                    # 如果原始 url 不包含 tsfile 或 .m3u8，则视为组播格式，使用 chid 补全
+                                    # 根据该 IP 正确的端口进行拼接
                                     if "tsfile" in raw_url.lower() or ".m3u8" in raw_url.lower():
-                                        final_url = f"http://{ip}:{TARGET_PORT}{raw_url}"
+                                        final_url = f"http://{ip}:{port}{raw_url}"
                                     else:
-                                        # 将 chid 转换为字符串，并用 0 补全至 4 位
                                         formatted_chid = str(chid).zfill(4)
-                                        final_url = f"http://{ip}:{TARGET_PORT}/tsfile/live/{formatted_chid}_1.m3u8?key=txiptv&playlive=1&authid=0"
-                                    # --------------------------------
+                                        final_url = f"http://{ip}:{port}/tsfile/live/{formatted_chid}_1.m3u8?key=txiptv&playlive=1&authid=0"
 
                                     clean_name, weight = clean_and_weight(name)
                                     cat = "央视" if weight < 100 else ("卫视" if weight < 300 else "地方")
@@ -108,7 +109,7 @@ async def fetch_data(session, ip_list):
                                         "weight": float(weight),
                                         "ip": ip
                                     })
-                                print(f"✅ [成功] {ip}:{TARGET_PORT} | 台数: {len(chunk)}")
+                                print(f"✅ [成功] {ip}:{port} | 台数: {len(chunk)}")
                                 return chunk
                 except Exception:
                     if attempt < 2:
@@ -116,48 +117,70 @@ async def fetch_data(session, ip_list):
                     continue
             return []
 
-    tasks = [fetch_single_ip(ip) for ip in ip_list]
+    tasks = [fetch_single_ip(target[0], target[1]) for target in target_list]
     all_chunks = await asyncio.gather(*tasks)
     for chunk in all_chunks:
         results.extend(chunk)
     return results
 
 async def main():
-    history_ips = []
+    history_targets = []
+    # 读取历史记录，兼容旧版纯 IP 数组格式，默认赋予第一个网段端口或跳过
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                history_ips = json.load(f)
+                old_history = json.load(f)
+                for ip in old_history:
+                    # 识别历史 IP 属于哪个段，补全端口
+                    matched = False
+                    for prefix, port in TARGET_CONFIG.items():
+                        if ip.startswith(prefix):
+                            history_targets.append((ip, port))
+                            matched = True
+                            break
+                    if not matched:
+                        history_targets.append((ip, 8082)) # 兜底端口
         except: pass
 
+    # 核心改动：生成带独立端口的任务元组列表 [(ip, port), ...]
+    scan_targets = []
+    for prefix, port in TARGET_CONFIG.items():
+        for i in range(256):
+            for j in range(256):
+                ip = f"{prefix}.{i}.{j}"
+                if ip not in IP_BLACKLIST:
+                    scan_targets.append((ip, port))
 
-    scan_ips = []
-    for prefix in TARGET_PREFIXES:
-        scan_ips.extend([f"{prefix}.{i}.{j}" for i in range(256) for j in range(256)])
+    # 去重组合
+    all_targets = list(dict.fromkeys(history_targets + scan_targets))
     
     if IP_BLACKLIST:
         print(f"🛡️ 已从扫描列表中屏蔽 {len(IP_BLACKLIST)} 个黑名单 IP。")
     
     semaphore = asyncio.Semaphore(CONCURRENCY)
-    alive_ips = []
-    for prefix in TARGET_PREFIXES:
-        scan_ips.extend([f"{prefix}.{i}.{j}" for i in range(256) for j in range(256)])
-    
-    # 💡 补上这一行：融合历史 IP 和新生成的 IP，进行去重并过滤黑名单
-    all_ips = [ip for ip in dict.fromkeys(history_ips + scan_ips) if ip not in IP_BLACKLIST]
-    
-    if IP_BLACKLIST:
-        print(f"🛡️ 已从扫描列表中屏蔽 {len(IP_BLACKLIST)} 个黑名单 IP。")
-    
-    semaphore = asyncio.Semaphore(CONCURRENCY)
-    alive_ips = []
+    alive_targets = []
 
-    # 此时 len(all_ips) 就能被正常读取，不会再报错了
-    print(f"🚀 开始探测 {len(all_ips)} 个目标 (端口: {TARGET_PORT})")
+    print(f"🚀 开始探测 {len(all_targets)} 个目标（按段分配专属端口）")
+    with tqdm(total=len(all_targets), desc="🔍 扫描进度", unit="IP", colour="cyan") as pbar:
+        async def run_task(ip, port):
+            res = await check_host_alive(semaphore, ip, port, pbar)
+            if res:
+                alive_targets.append(res)
 
-    if alive_ips:
+        tasks = []
+        for ip, port in all_targets:
+            tasks.append(run_task(ip, port))
+            if len(tasks) >= 2000: 
+                await asyncio.gather(*tasks)
+                tasks = []
+        if tasks:
+            await asyncio.gather(*tasks)
+    
+    print(f"\n📡 探测完成，共找到 {len(alive_targets)} 个活跃服务器。")
+
+    if alive_targets:
         async with aiohttp.ClientSession() as session:
-            all_channels = await fetch_data(session, alive_ips)
+            all_channels = await fetch_data(session, alive_targets)
         if all_channels:
             all_channels.sort(key=lambda x: ({"央视":0,"卫视":1,"地方":2}.get(x['cat'],3), x['weight'], x['name']))
             os.makedirs("py", exist_ok=True)
