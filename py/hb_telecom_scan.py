@@ -12,7 +12,7 @@ from tqdm import tqdm
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # --- 配置 ---
-TARGET_PREFIX = "171.38"
+TARGET_PREFIXES = ["171.38", "60.223"] 
 TARGET_PORT = 8082
 CHECK_PATH = "/iptv/live/1000.json?key=txipt"
 M3U_FILE = "py/hb_telecom.m3u"
@@ -130,8 +130,10 @@ async def main():
                 history_ips = json.load(f)
         except: pass
 
-    scan_ips = [f"{TARGET_PREFIX}.{i}.{j}" for i in range(256) for j in range(256)]
-    all_ips = [ip for ip in dict.fromkeys(history_ips + scan_ips) if ip not in IP_BLACKLIST]
+
+    scan_ips = []
+    for prefix in TARGET_PREFIXES:
+        scan_ips.extend([f"{prefix}.{i}.{j}" for i in range(256) for j in range(256)])
     
     if IP_BLACKLIST:
         print(f"🛡️ 已从扫描列表中屏蔽 {len(IP_BLACKLIST)} 个黑名单 IP。")
