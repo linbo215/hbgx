@@ -140,24 +140,20 @@ async def main():
     
     semaphore = asyncio.Semaphore(CONCURRENCY)
     alive_ips = []
-
-    print(f"🚀 开始探测 {len(all_ips)} 个目标 (端口: {TARGET_PORT})")
-    with tqdm(total=len(all_ips), desc="🔍 扫描进度", unit="IP", colour="cyan") as pbar:
-        async def run_task(ip):
-            res = await check_host_alive(semaphore, ip, pbar)
-            if res:
-                alive_ips.append(res)
-
-        tasks = []
-        for ip in all_ips:
-            tasks.append(run_task(ip))
-            if len(tasks) >= 2000: 
-                await asyncio.gather(*tasks)
-                tasks = []
-        if tasks:
-            await asyncio.gather(*tasks)
+    for prefix in TARGET_PREFIXES:
+        scan_ips.extend([f"{prefix}.{i}.{j}" for i in range(256) for j in range(256)])
     
-    print(f"\n📡 探测完成，共找到 {len(alive_ips)} 个活跃服务器。")
+    # 💡 补上这一行：融合历史 IP 和新生成的 IP，进行去重并过滤黑名单
+    all_ips = [ip for ip in dict.fromkeys(history_ips + scan_ips) if ip not in IP_BLACKLIST]
+    
+    if IP_BLACKLIST:
+        print(f"🛡️ 已从扫描列表中屏蔽 {len(IP_BLACKLIST)} 个黑名单 IP。")
+    
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+    alive_ips = []
+
+    # 此时 len(all_ips) 就能被正常读取，不会再报错了
+    print(f"🚀 开始探测 {len(all_ips)} 个目标 (端口: {TARGET_PORT})")
 
     if alive_ips:
         async with aiohttp.ClientSession() as session:
